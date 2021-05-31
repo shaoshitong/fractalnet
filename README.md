@@ -1,0 +1,2 @@
+# fractalnet
+pytorch --version --cpu
