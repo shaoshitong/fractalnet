@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.jit import ScriptModule, script_method, trace
@@ -143,7 +144,12 @@ class fractal_conv(nn.Module):
         self.bn=nn.BatchNorm2d(filter)
         self.filter=filter
         self.relu=nn.ReLU()
-
+        self.conv.bias.data.fill_(0)
+        self.conv2.bias.data.fill_(0)
+        self.limit=math.sqrt(6./(nb_col*nb_col*(in_filter+filter)))
+        self.limit2 = math.sqrt(6. / (nb_col * nb_col * (filter + filter)))
+        torch.nn.init.uniform_(self.conv.weight, a=-self.limit, b=self.limit)
+        torch.nn.init.uniform_(self.conv2.weight, a=-self.limit2, b=self.limit2)
     def forward(self,x):
         if x.shape[1]==self.filter:
             x=self.conv2(x)
