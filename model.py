@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from torch.jit import ScriptModule, script_method, trace
 from torch.nn.parameter import Parameter
 class myenumerate:
     def __init__(self, wrapped,end=None):
@@ -43,6 +44,7 @@ class mulLayer(nn.Module):
             self.global_path=Parameter(torch.tensor(global_path,dtype=torch.float64))
         else:
             self.global_path = Parameter(global_path.float())
+
     def forward(self,x):
         while self.global_path.ndim !=x.ndim:
             self.global_path=Parameter(self.global_path.unsqueeze(-1))
@@ -87,6 +89,7 @@ class JoinLayer(nn.Module):
         return ave.squeeze(0)/indexsum if indexsum else ave.squeeze(0)
     def _ave(self, inputs):
         return torch.mean(inputs.float(), dim=0, keepdim=True)
+
     def forward(self,inputs):
         inputs= self._drop_path(inputs) if self.force_path or inputs.requires_grad else self._ave(inputs)
         return inputs
@@ -140,6 +143,7 @@ class fractal_conv(nn.Module):
         self.bn=nn.BatchNorm2d(filter)
         self.filter=filter
         self.relu=nn.ReLU()
+
     def forward(self,x):
         if x.shape[1]==self.filter:
             x=self.conv2(x)
@@ -153,7 +157,7 @@ class fractal_conv(nn.Module):
 class fractal_block(nn.Module):
     def __init__(self,join_gen,c,in_filter,filter,nb_col,nb_row,drop_p,dropout=None):
         super(fractal_block, self).__init__()
-        self.columns=lambda z:[[z] for _ in range(c)]
+        self.columns=lambda z:[[z.cuda()] for _ in range(c)]
         self.fractal_conv=fractal_conv(in_filter,filter,nb_col,dropout)
         self.merged= join_gen.get_join_layer(drop_p=drop_p)
         self.c=c
@@ -163,6 +167,7 @@ class fractal_block(nn.Module):
         self.nb_row=nb_row
         self.drop_p=drop_p
         self.dropout=dropout
+
     def forward(self,x):
         x=self.columns(x)
         for row in range(2**(self.c-1)):
@@ -170,15 +175,13 @@ class fractal_block(nn.Module):
             for col in range(self.c):
                 prop=2**(col)
                 if (row+1)%prop==0:
-                    t_col=x[col]
-                    t_col.append(self.fractal_conv(t_col[-1]))
+                    x[col][-1]=self.fractal_conv(x[col][-1])
                     t_row.append(col)
-                    x[col]=t_col
             if len(t_row)>1:
-                merging=torch.tensor([x[i][-1].detach().numpy() for i in t_row],dtype=torch.float32)
+                merging=torch.tensor([x[i][-1].cpu().detach().numpy() for i in t_row],dtype=torch.float32).cuda()
                 merged = self.merged(merging)
                 for i in t_row:
-                    x[i].append(merged)
+                    x[i][-1]=merged
         return x[0][-1]
 class fractal_net(nn.Module):
     def __init__(self,b,c,conv,drop_path,global_p=0.5,dropout=None,deepest=False):
@@ -200,6 +203,7 @@ class fractal_net(nn.Module):
                                  nb_row=nb_row,
                                  drop_p=drop_path,
                                  dropout=dropout[i] if dropout else None),nn.MaxPool2d((2,2),stride=(2,2))]])
+
     def forward(self,x):
         global output
         output=x

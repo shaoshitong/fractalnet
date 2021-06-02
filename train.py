@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
+from torch.jit import ScriptModule, script_method, trace
 import time
 import torch.nn.init as init
 from cifar10 import load_data
@@ -13,9 +14,9 @@ from model import fractal_net
 parser = argparse.ArgumentParser(description='Weight Decay Experiments')
 parser.add_argument('--nb_classes', dest='nb_classes', help='the number of classes', default=10, type=int)
 parser.add_argument('--nb_epochs', dest='nb_epochs', help='the number of epochs', default=200, type=int)
-parser.add_argument('--learn_start', dest='learn_start', help='the learning rate at begin', default=0.1, type=float)
+parser.add_argument('--learn_start', dest='learn_start', help='the learning rate at begin', default=0.02, type=float)
 parser.add_argument('--batch_size', dest='batch_size', help='training batch size', default=64, type=int)
-parser.add_argument('--momentum', dest='momentum', help='the momentum', default=0.9, type=float)
+parser.add_argument('--momentum', dest='momentum', help='the momentum', default=0.5, type=float)
 parser.add_argument('--schedule', dest='schedule', help='weight Decrease learning rate',default=[100,150],type=int,nargs='+')
 parser.add_argument('--gamma', dest='gamma', help='gamma', default=0.1, type=float)
 parser.add_argument('--train_dir', dest='train_dir', help='training data dir', default="tmp", type=str)
@@ -51,6 +52,7 @@ class network(nn.Module):
         self.softmax=nn.Softmax(dim=1)
         init.kaiming_normal_(self.linear.weight)
         self.linear.bias.data.fill_(1)
+
     def forward(self,x):
         x=self.fractal_net(x)
         x=x.view(x.shape[0],-1)
@@ -60,12 +62,17 @@ class network(nn.Module):
 def train_network(data_loader,model,writer,criterion,optimizer,lr_scheduler):
     print("Training network")
     best_acc=.0
+    model.train(mode=True)
     for i in range(args.nb_epochs):
         begin=time.time()
         losses=0.0
         prec1ss=0.0
         prec5ss=0.0
         for j, (input, target) in enumerate(data_loader):
+            if torch.cuda.is_available():
+                input = input.cuda()
+                target = target.cuda(non_blocking=True)
+            input.requires_grad_()
             output = model(input)
             loss = criterion(output, target)
             optimizer.zero_grad()
@@ -75,9 +82,17 @@ def train_network(data_loader,model,writer,criterion,optimizer,lr_scheduler):
             prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
             prec1ss=prec1ss+float(prec1.item())
             prec5ss=prec5ss+float(prec5.item())
-            print("train:epoch {} [{}/{}] loss is {:.3f},top1 is {:.3f}%,top5 is {:.3f}%".format(i,j*args.batch_size,
-                                                                                            len(data_loader)*args.batch_size,float(loss.item()),
-                                                                                            float(prec1.item()),float(prec5.item())))
+            if j % 100 == 0:
+                print("train:epoch {} [{}/{}] loss is {:.3f},top1 is {:.3f}%,top5 is {:.3f}%".format(i,
+                                                                                                     j * args.batch_size,
+                                                                                                     len(
+                                                                                                         data_loader) * args.batch_size,
+                                                                                                     float(losses / (
+                                                                                                                 j + 1)),
+                                                                                                     float(prec1ss / (
+                                                                                                                 j + 1)),
+                                                                                                     float(prec5ss / (
+                                                                                                                 j + 1))))
         prec1ss=round(1.0*prec1ss/float(len(data_loader)),3)
         prec5ss=round(1.0 * prec5ss / float(len(data_loader)),3)
         if prec1ss>best_acc:
@@ -89,30 +104,51 @@ def train_network(data_loader,model,writer,criterion,optimizer,lr_scheduler):
         writer.add_scalar('loss', 1.0 * prec1ss / float(len(data_loader)), i)
         writer.add_scalar('loss', 1.0 * prec5ss / float(len(data_loader)), i)
         print("train:epoch {} loss is {:.3f},time is {:.3f},top1 is {:.3f}%,top5 is {:.3f}%".format(i,losses,be_time,prec1ss,prec5ss))
+    writer.close()
     return model
 def test_network(data_loader,model,criterion):
     losses=0.0
     prec1ss=0.0
     prec5ss=0.0
+    model.eval()
     begin=time.time()
-    for j, (input, target) in enumerate(data_loader):
-        output = model(input)
-        loss = criterion(output, target)
-        losses = losses + float(loss.item())
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        prec1ss = prec1ss + float(prec1.item())
-        prec5ss = prec5ss + float(prec5.item())
-    prec1ss = round(1.0 * prec1ss / float(len(data_loader)), 3)
-    prec5ss = round(1.0 * prec5ss / float(len(data_loader)), 3)
-    be_time = time.time() - begin
-    print("test:loss is {:.3f},time is {:.3f},top1 is {:.3f},top5 is {:.3f}".format( losses, be_time, prec1ss, prec5ss))
+    with torch.no_grad():
+        for j, (input, target) in enumerate(data_loader):
+            if torch.cuda.is_available():
+                input = input.cuda()
+                target = target.cuda(non_blocking=True)
+            input.requires_grad_()
+            torch.cuda.synchronize()
+            output = model(input)
+            torch.cuda.synchronize()
+            loss = criterion(output, target)
+            losses = losses + float(loss.item())
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            prec1ss = prec1ss + float(prec1.item())
+            prec5ss = prec5ss + float(prec5.item())
+            if j % 100 == 0:
+                print("train: [{}/{}] loss is {:.3f},top1 is {:.3f}%,top5 is {:.3f}%".format(j * args.batch_size,
+                                                                                                     len(
+                                                                                                         data_loader) * args.batch_size,
+                                                                                                     float(losses / (
+                                                                                                                 j + 1)),
+                                                                                                     float(prec1ss / (
+                                                                                                                 j + 1)),
+                                                                                                     float(prec5ss / (
+                                                                                                                 j + 1))))
+        prec1ss = round(1.0 * prec1ss / float(len(data_loader)), 3)
+        prec5ss = round(1.0 * prec5ss / float(len(data_loader)), 3)
+        be_time = time.time() - begin
+        print("test:loss is {:.3f},time is {:.3f},top1 is {:.3f},top5 is {:.3f}".format( losses, be_time, prec1ss, prec5ss))
 if __name__=="__main__":
     torch.cuda.empty_cache()
     train_loader, test_loader = load_data(args.batch_size, args.batch_size)
     writer = SummaryWriter(args.train_dir)
     criterion = nn.CrossEntropyLoss()
     model=network(deepest=args.deepest)
-    print(model)
+    if torch.cuda.is_available():##将之放入GPU计算
+        model = model.cuda()
+        criterion = criterion.cuda()
     optimizer = torch.optim.SGD(filter(lambda i: i.requires_grad, model.parameters()), args.learn_start,
                                 momentum=args.momentum, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.schedule, gamma=args.gamma)
